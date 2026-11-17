@@ -65,6 +65,8 @@ p { margin: 0; max-width: 62ch; }
 .progress-text { font: 500 0.8rem/1 var(--font-mono); color: var(--muted); text-align: right; font-variant-numeric: tabular-nums; }
 .panel { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 20px; display: grid; gap: 14px; }
 ol.steps { margin: 0; padding-left: 1.2em; display: grid; gap: 6px; }
+.again { margin-top: 28px; padding-top: 20px; border-top: 1px solid var(--line); }
+.again p { margin: 0 0 4px; }
 .genres { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 10px; }
 .genre { position: relative; display: block; cursor: pointer; }
 .genre input { position: absolute; opacity: 0; inset: 0; margin: 0; cursor: pointer; }
@@ -182,6 +184,10 @@ textarea { width: 100%; min-height: 120px; font: 0.8rem/1.4 var(--font-mono); ba
     <p class="muted">If the study team asks for a backup, copy the code below and send it to them.</p>
     <textarea id="backup" readonly aria-label="Backup of your ratings"></textarea>
     <div class="actions"><span class="status" id="copyStatus"></span><button class="secondary" id="copyBtn">Copy backup code</button></div>
+    <div class="again">
+      <p><b>Want to rate more?</b> You'll pick genres again and get song sets you haven't rated yet.</p>
+      <div class="actions"><span class="status" id="againStatus"></span><button id="againBtn">Rate more songs</button></div>
+    </div>
   </section>
 </div>
 
@@ -206,19 +212,23 @@ const setsById = Object.fromEntries(STUDY.sets.map((s) => [s.set_id, s]));
 
 // Each chosen genre contributes its anchor set first (shared by everyone who picks that genre),
 // then its other sets in a random order; sets are taken round-robin across genres.
-function newState(genres) {
-  const rater = newId();
+// A rater who comes back for more keeps the same rater ID and only gets sets they haven't rated yet.
+function newState(genres, prev) {
+  const rater = prev ? prev.rater : newId();
+  const done = prev ? prev.done : [];
+  const pass = prev ? prev.pass : 1;
+  const salt = pass > 1 ? rater + "#" + pass : rater;
   const pools = genres.map((g) => {
-    const gs = STUDY.sets.filter((s) => s.genre === g);
+    const gs = STUDY.sets.filter((s) => s.genre === g && !done.includes(s.set_id));
     const anchor = gs.filter((s) => s.anchor).map((s) => s.set_id);
-    const rest = shuffle(gs.filter((s) => !s.anchor).map((s) => s.set_id), rater + g);
+    const rest = shuffle(gs.filter((s) => !s.anchor).map((s) => s.set_id), salt + g);
     return anchor.concat(rest);
   });
   const picked = [];
   for (let r = 0; picked.length < STUDY.sets_per_rater && pools.some((p) => p.length > r); r++)
     for (const p of pools) if (p.length > r && picked.length < STUDY.sets_per_rater) picked.push(p[r]);
-  const order = shuffle(picked, rater + "order");
-  return { rater, genres, order, idx: 0, ratings: {}, sent: {}, started: {}, secs: {}, finished: false };
+  const order = shuffle(picked, salt + "order");
+  return { rater, genres, order, idx: 0, ratings: {}, sent: {}, started: {}, secs: {}, finished: false, done, pass };
 }
 
 let state = load();
@@ -240,9 +250,15 @@ $("startBtn").addEventListener("click", () => {
   if (state) return showRound();
   $("intro").hidden = true; $("pickGenres").hidden = false; window.scrollTo({ top: 0 });
 });
+let again = null;  // set when a finished rater asks to rate more
 $("genresBtn").addEventListener("click", () => {
   const genres = [...document.querySelectorAll("#genreList input:checked")].map((i) => i.value);
-  state = newState(genres); save(); showRound();
+  const next = newState(genres, again);
+  if (!next.order.length) {
+    $("genreStatus").textContent = "You've already rated every song set in these genres. Try other genres.";
+    return;
+  }
+  state = next; again = null; save(); showRound();
 });
 
 function trackHTML(t, withPlayer) {
@@ -307,7 +323,7 @@ function updateNext() {
 function payloadFor(sid) {
   const r = state.ratings[sid] || {};
   return {
-    v: STUDY.version, rater: state.rater, genres: state.genres, set_id: sid, pos: state.order.indexOf(sid),
+    v: STUDY.version, rater: state.rater, genres: state.genres, set_id: sid, pos: state.order.indexOf(sid), pass: state.pass || 1,
     secs: state.secs[sid] || null, ts: new Date().toISOString(),
     ratings: setsById[sid].items.map((t) => ({ iid: t.iid, s: (r[t.iid] || {}).s || null, k: !!(r[t.iid] || {}).k })),
   };
@@ -356,6 +372,21 @@ function showDone() {
     if (!state.order.some((sid) => !state.sent[sid])) $("doneMsg").textContent = "Your ratings were sent. You can close this page.";
   });
 }
+$("againBtn").addEventListener("click", async () => {
+  if (!testMode && state.order.some((sid) => !state.sent[sid])) {
+    $("againStatus").textContent = "Sending your last ratings first…";
+    await flushUnsent();
+    if (state.order.some((sid) => !state.sent[sid])) {
+      $("againStatus").textContent = "Some ratings haven't been sent yet. Copy the backup code, then try again.";
+      return;
+    }
+  }
+  again = { rater: state.rater, done: (state.done || []).concat(state.order), pass: (state.pass || 1) + 1 };
+  document.querySelectorAll("#genreList input").forEach((i) => { i.checked = false; });
+  $("genresBtn").disabled = true;
+  $("genreStatus").textContent = `Pick at least ${STUDY.min_genres} genres`;
+  $("done").hidden = true; $("progress").hidden = true; $("pickGenres").hidden = false; window.scrollTo({ top: 0 });
+});
 $("copyBtn").addEventListener("click", () => {
   const ta = $("backup");
   navigator.clipboard.writeText(ta.value)
